@@ -1,0 +1,123 @@
+name: Build image (reusable)
+
+# Reusable image build for TON Connect services: build the service's container
+# image once per commit and publish it to ECR, tagged with the full and the
+# short commit sha. Callers say WHICH repository/role/dockerfile; this workflow
+# owns HOW images are built, so the logic lives in one place.
+#
+# Call from a push-only workflow — OIDC credentials must never be mintable from
+# fork pull requests, so callers must not use pull_request triggers:
+#
+#   permissions: { id-token: write, contents: read }
+#   jobs:
+#     build:
+#       uses: ton-connect/ci/.github/workflows/build-image.yml@main
+#       with:
+#         ecr-repository: <service>
+#         role-arn: arn:aws:iam::<account>:role/gha-ecr-push-<service>
+#
+# Services that test the built image add their own job between checkout and the
+# call, or gate deployment on a separate test workflow — this workflow only
+# builds and publishes.
+
+on:
+  workflow_call:
+    inputs:
+      ecr-repository:
+        description: ECR repository name
+        required: true
+        type: string
+      role-arn:
+        description: OIDC role with push access to the ECR repository
+        required: true
+        type: string
+      dockerfile:
+        description: Path to the Dockerfile
+        required: false
+        type: string
+        default: Dockerfile
+      context:
+        description: Docker build context
+        required: false
+        type: string
+        default: "."
+      runner:
+        description: Runner label; service images are arm64 by default
+        required: false
+        type: string
+        default: ubuntu-24.04-arm
+      aws-region:
+        description: ECR region
+        required: false
+        type: string
+        default: eu-central-1
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+
+    env:
+      AWS_REGION: ${{ inputs.aws-region }}
+      ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+      ROLE_ARN: ${{ inputs.role-arn }}
+      DOCKERFILE: ${{ inputs.dockerfile }}
+      BUILD_CONTEXT: ${{ inputs.context }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The registry host is the role's account in the build region — derived,
+      # so callers never repeat their account id.
+      - name: Derive registry
+        run: |
+          ACCOUNT_ID="$(echo "$ROLE_ARN" | cut -d: -f5)"
+          echo "ECR_REGISTRY=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_ENV"
+
+      # Image tags are immutable: re-running a build for a sha that is already
+      # published is a success, not a failure. If the tag exists, short-circuit
+      # the rest of the job.
+      - name: Check for existing image
+        id: guard
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          if aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "Image for $IMAGE_TAG already published; skipping build."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to registry
+        if: steps.guard.outputs.exists != 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # provenance/sbom attestations off so the pushed artifact is a plain
+      # single-arch manifest, not an OCI image index.
+      - name: Build image
+        if: steps.guard.outputs.exists != 'true'
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+          docker build \
+            --provenance=false \
+            --sbom=false \
+            -f "$DOCKERFILE" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA" \
+            "$BUILD_CONTEXT"
+
+      - name: Push image
+        if: steps.guard.outputs.exists != 'true'
+        run: |
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA"
