@@ -52,6 +52,15 @@ on:
         type: string
         default: eu-central-1
 
+# Serialize same-(repository,sha) runs into one lane so a push and a
+# workflow_dispatch of the SAME commit do not both build and race on the immutable
+# tag. Under workflow_call github.sha is the CALLER's commit. cancel-in-progress:
+# false lets the in-flight push finish; the queued duplicate then hits the
+# pre-check and skips.
+concurrency:
+  group: build-${{ inputs.ecr-repository }}-${{ github.sha }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ${{ inputs.runner }}
@@ -73,25 +82,30 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # The registry host is the role's account in the build region — derived,
-      # so callers never repeat their account id.
-      - name: Derive registry
+      # The registry host is the role's account in the build region — derived, so
+      # callers never repeat their account id. Also pin the short sha here so the
+      # pre-check below (which runs before the build) can require it.
+      - name: Derive registry and short sha
         run: |
           ACCOUNT_ID="$(echo "$ROLE_ARN" | cut -d: -f5)"
           echo "ECR_REGISTRY=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
-      # Image tags are immutable: re-running a build for a sha that is already
-      # published is a success, not a failure. If the tag exists, short-circuit
-      # the rest of the job.
+      # Image tags are immutable: re-running a build for an already-published sha is
+      # a success, not a failure. Skip ONLY when BOTH the full AND the short sha tag
+      # are already in ECR. A single describe-images with two --image-ids errors
+      # unless BOTH are present (DescribeImages fails on ANY missing id), so this one
+      # call yields exact AND semantics. Prod deploys by the short 7-char tag, so
+      # requiring the short tag too closes the gap where a re-run saw the full tag
+      # alone, skipped, and never created the short tag — a silent ImagePullBackOff
+      # behind a green build.
       - name: Check for existing image
         id: guard
-        env:
-          IMAGE_TAG: ${{ github.sha }}
         run: |
           if aws ecr describe-images \
             --repository-name "$ECR_REPOSITORY" \
-            --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
-            echo "Image for $IMAGE_TAG already published; skipping build."
+            --image-ids imageTag="$GITHUB_SHA" imageTag="$SHORT_SHA" >/dev/null 2>&1; then
+            echo "Both tags ($GITHUB_SHA, $SHORT_SHA) already published; skipping build."
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -106,8 +120,6 @@ jobs:
       - name: Build image
         if: steps.guard.outputs.exists != 'true'
         run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
           docker build \
             --provenance=false \
             --sbom=false \
@@ -116,8 +128,30 @@ jobs:
             -t "$ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA" \
             "$BUILD_CONTEXT"
 
-      - name: Push image
+      - name: Push both sha tags (state-based idempotency on immutable-tag collision)
         if: steps.guard.outputs.exists != 'true'
         run: |
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA"
+          push_idempotent() {
+            local tag="$1" ref out rc
+            ref="$ECR_REGISTRY/$ECR_REPOSITORY:$tag"
+            # GH Actions runs run: under `bash -eo pipefail`; a bare out=$(cmd) exits
+            # the step the instant the push fails, before we can read rc. An
+            # if-guarded assignment is exempt from errexit.
+            if out="$(docker push "$ref" 2>&1)"; then rc=0; else rc=$?; fi
+            echo "$out"
+            [ "$rc" -eq 0 ] && return 0
+            # The only tolerated failure is a concurrent run already landing this
+            # exact immutable tag. ECR prints no CamelCase token for that, so decide
+            # by STATE, not message text: if the tag is now present, the artifact we
+            # wanted is there.
+            if aws ecr describe-images \
+                 --repository-name "$ECR_REPOSITORY" \
+                 --image-ids imageTag="$tag" >/dev/null 2>&1; then
+              echo "Tag $tag already present in ECR (concurrent push); treating as success."
+              return 0
+            fi
+            echo "docker push failed and tag $tag is absent from ECR; failing." >&2
+            return "$rc"
+          }
+          push_idempotent "$GITHUB_SHA"
+          push_idempotent "$SHORT_SHA"
