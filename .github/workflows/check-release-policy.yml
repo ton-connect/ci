@@ -1,0 +1,85 @@
+name: check-release-policy
+
+# Runs `release-resolver check` from ECR on a pull request and annotates each refusal on its file.
+# A PR that changes no release file passes unchecked; a fork PR that changes one fails at credentials.
+#
+#   permissions: { contents: read, id-token: write }
+#   jobs:
+#     release-policy:
+#       uses: ton-connect/ci/.github/workflows/check-release-policy.yml@main
+#       with:
+#         service: <catalog key>
+#         release-resolver: ${{ vars.IDP_RELEASE_RESOLVER }}
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Catalog key of the service = gha-ecr-read-<service> role suffix."
+        required: true
+        type: string
+      release-resolver:
+        description: 'Pass vars.IDP_RELEASE_RESOLVER: "on" accepts the prod:/staging: form of version.yaml, any other value refuses it.'
+        required: false
+        type: string
+        default: ""
+
+env:
+  # The release-resolver commit the check runs, so it judges by the rules the resolver applies.
+  # Move it only after the prod Deployment runs the new commit.
+  RESOLVER_IMAGE: 990678687129.dkr.ecr.eu-central-1.amazonaws.com/release-resolver:7fa61555c18f0e9fecb0190ceb170aa01aa4f838
+
+jobs:
+  release-policy:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The later steps skip and the job stays green: a required check must report on every PR.
+      - name: Detect release file changes
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -z "$BASE_SHA" ]; then
+            echo "::error::pull_request.base.sha is empty; call this workflow from a pull_request event"
+            exit 1
+          fi
+          files="$(git diff --name-only "$BASE_SHA...HEAD" -- version.yaml service.yaml service.staging.yaml .no-staging)"
+          if [ -n "$files" ]; then
+            echo "$files"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release files unchanged"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure credentials
+        if: steps.changed.outputs.changed == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::990678687129:role/gha-ecr-read-${{ inputs.service }}
+          aws-region: eu-central-1
+
+      - name: Log in to registry
+        if: steps.changed.outputs.changed == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check release policy
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          NEW_FORM: ${{ inputs.release-resolver }}
+        run: |
+          docker run --rm -v "$PWD:/src:ro" \
+            -e GITHUB_TOKEN -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_REGION \
+            "$RESOLVER_IMAGE" check --dir /src --org "$OWNER" --repo "$REPO" \
+            --default-branch "$DEFAULT_BRANCH" --new-form "$NEW_FORM"
