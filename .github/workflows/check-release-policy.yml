@@ -9,7 +9,6 @@ name: check-release-policy
 #       uses: ton-connect/ci/.github/workflows/check-release-policy.yml@main
 #       with:
 #         service: <catalog key>
-#         release-resolver: ${{ vars.IDP_RELEASE_RESOLVER }}
 
 on:
   workflow_call:
@@ -19,7 +18,7 @@ on:
         required: true
         type: string
       release-resolver:
-        description: 'Pass vars.IDP_RELEASE_RESOLVER: "on" accepts the prod:/staging: form of version.yaml, any other value refuses it.'
+        description: "Ignored. Kept so callers that still pass it keep working."
         required: false
         type: string
         default: ""
@@ -27,7 +26,7 @@ on:
 env:
   # The release-resolver commit the check runs, so it judges by the rules the resolver applies.
   # Move it only after the prod Deployment runs the new commit.
-  RESOLVER_IMAGE: 990678687129.dkr.ecr.eu-central-1.amazonaws.com/release-resolver:7fa61555c18f0e9fecb0190ceb170aa01aa4f838
+  RESOLVER_IMAGE: 990678687129.dkr.ecr.eu-central-1.amazonaws.com/release-resolver:64460096306e48df53b55a84061fdf34a1724561
 
 jobs:
   release-policy:
@@ -50,7 +49,7 @@ jobs:
             echo "::error::pull_request.base.sha is empty; call this workflow from a pull_request event"
             exit 1
           fi
-          files="$(git diff --name-only "$BASE_SHA...HEAD" -- version.yaml service.yaml service.staging.yaml .no-staging)"
+          files="$(git diff --name-only "$BASE_SHA...HEAD" -- version.yaml service.yaml service.staging.yaml)"
           if [ -n "$files" ]; then
             echo "$files"
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -77,9 +76,8 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          NEW_FORM: ${{ inputs.release-resolver }}
         run: |
           docker run --rm -v "$PWD:/src:ro" \
             -e GITHUB_TOKEN -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_REGION \
             "$RESOLVER_IMAGE" check --dir /src --org "$OWNER" --repo "$REPO" \
-            --default-branch "$DEFAULT_BRANCH" --new-form "$NEW_FORM"
+            --default-branch "$DEFAULT_BRANCH"
