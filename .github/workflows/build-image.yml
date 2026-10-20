@@ -1,9 +1,9 @@
 name: Build image (reusable)
 
 # Reusable image build for TON Connect services: build the service's container
-# image once per commit and publish it to ECR, tagged with the full and the
-# short commit sha. Callers say WHICH repository/role/dockerfile; this workflow
-# owns HOW images are built, so the logic lives in one place.
+# image once per commit and publish it to ECR, tagged with the full commit sha.
+# Callers say WHICH repository/role/dockerfile; this workflow owns HOW images are
+# built, so the logic lives in one place.
 #
 # Call from a push-only workflow — OIDC credentials must never be mintable from
 # fork pull requests, so callers must not use pull_request triggers:
@@ -74,38 +74,30 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       # The registry host is the role's account in the build region — derived, so
-      # callers never repeat their account id. Also pin the short sha here so the
-      # pre-check below (which runs before the build) can require it.
-      - name: Derive registry and short sha
+      # callers never repeat their account id.
+      - name: Derive registry
         run: |
           ACCOUNT_ID="$(echo "$ROLE_ARN" | cut -d: -f5)"
           echo "ECR_REGISTRY=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_ENV"
-          echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
       # Image tags are immutable: re-running a build for an already-published sha is
-      # a success, not a failure. Skip ONLY when BOTH the full AND the short sha tag
-      # are already in ECR. A single describe-images with two --image-ids errors
-      # unless BOTH are present (DescribeImages fails on ANY missing id), so this one
-      # call yields exact AND semantics. Prod deploys by the short 7-char tag, so
-      # requiring the short tag too closes the gap where a re-run saw the full tag
-      # alone, skipped, and never created the short tag — a silent ImagePullBackOff
-      # behind a green build.
+      # a success, not a failure.
       - name: Check for existing image
         id: guard
         run: |
           if aws ecr describe-images \
             --repository-name "$ECR_REPOSITORY" \
-            --image-ids imageTag="$GITHUB_SHA" imageTag="$SHORT_SHA" >/dev/null 2>&1; then
-            echo "Both tags ($GITHUB_SHA, $SHORT_SHA) already published; skipping build."
+            --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "Tag $GITHUB_SHA already published; skipping build."
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -113,7 +105,7 @@ jobs:
 
       - name: Log in to registry
         if: steps.guard.outputs.exists != 'true'
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       # provenance/sbom attestations off so the pushed artifact is a plain
       # single-arch manifest, not an OCI image index.
@@ -125,10 +117,9 @@ jobs:
             --sbom=false \
             -f "$DOCKERFILE" \
             -t "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" \
-            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA" \
             "$BUILD_CONTEXT"
 
-      - name: Push both sha tags (state-based idempotency on immutable-tag collision)
+      - name: Push the sha tag (state-based idempotency on immutable-tag collision)
         if: steps.guard.outputs.exists != 'true'
         run: |
           push_idempotent() {
@@ -154,4 +145,3 @@ jobs:
             return "$rc"
           }
           push_idempotent "$GITHUB_SHA"
-          push_idempotent "$SHORT_SHA"
