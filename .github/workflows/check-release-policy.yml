@@ -58,9 +58,11 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           BASE_REF: ${{ github.base_ref }}
         run: |
-          v="$(git show "$BASE_SHA:version.yaml" 2>/dev/null || true)"
-          branch="$(printf '%s\n' "$v" | awk '/^[^ #]/ { top = $1 } top == "prod:" && $1 == "branch:" { gsub(/"/, "", $2); print $2; exit }')"
-          [ -n "$branch" ] || branch="$(printf '%s\n' "$v" | sed -n 's/^prod:[[:space:]]*{.*branch:[[:space:]]*"\{0,1\}\([^",} ]*\).*/\1/p')"
+          # Quotes, CR and a BOM are dropped first: the resolver's YAML parser accepts all three, a line match does not.
+          v="$(git show "$BASE_SHA:version.yaml" 2>/dev/null | tr -d "\r\"'" || true)"
+          v="${v#$'\357\273\277'}"
+          branch="$(printf '%s\n' "$v" | awk '/^[^ #]/ { top = $1 } top == "prod:" && $1 == "branch:" { print $2; exit }')"
+          [ -n "$branch" ] || branch="$(printf '%s\n' "$v" | sed -n 's/^prod:[[:space:]]*{.*branch:[[:space:]]*\([^,} ]*\).*/\1/p')"
           if [ "$branch" = "$BASE_REF" ]; then
             msg="merging this pull request deploys prod: version.yaml on $BASE_REF declares prod: {branch: $BASE_REF}"
             echo "::notice::$msg"
