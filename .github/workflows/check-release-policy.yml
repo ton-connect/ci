@@ -96,6 +96,7 @@ jobs:
               --default-branch "$DEFAULT_BRANCH" --base-sha "$BASE_SHA"
           }
           if check; then exit 0; else rc=$?; fi
-          [ "$rc" -eq 2 ] || exit "$rc"
-          echo "the check could not judge (exit 2), one retry"
+          # docker answers 125 when it could not pull the image, which says nothing about the pull request.
+          [ "$rc" -eq 2 ] || [ "$rc" -eq 125 ] || exit "$rc"
+          echo "the check could not judge (exit $rc), one retry"
           check
