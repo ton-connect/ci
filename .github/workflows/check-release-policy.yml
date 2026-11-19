@@ -21,7 +21,7 @@ on:
 env:
   # The release-resolver commit the check runs, so it judges by the rules the resolver applies.
   # Move it only after the prod Deployment runs the new commit.
-  RESOLVER_IMAGE: 990678687129.dkr.ecr.eu-central-1.amazonaws.com/release-resolver:dce154b8b2274ab0bd21645af1149b663ccc03d8
+  RESOLVER_IMAGE: 990678687129.dkr.ecr.eu-central-1.amazonaws.com/release-resolver:3e11d36097e83422780f33257bc58e1e8682b429
 
 jobs:
   release-policy:
